@@ -1,0 +1,14 @@
+# inventories/infra1/group_vars/certificate_group.yml
+cert_base_dir: /data/certificates
+cert_types: [client, server]
+
+ipa_realm: INFRA1.EXAMPLE.COM
+ipa_domain: infra1.example.com
+ipa_ca_subject: "Certificate Authority"
+ipaclient_host: ipaclient.infra1.example.com
+
+cert_owner: root
+cert_group: root
+cert_file_mode: "0644"
+key_file_mode:  "0600"
+cert_validity_days: 365

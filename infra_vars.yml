@@ -1,0 +1,4 @@
+# inventories/infra1/infra_vars.yml
+# Infra-level overrides — higher priority than group_vars.
+# Leave empty or add infra-specific deviations here.
+# cert_base_dir: /opt/infra1/certificates   # example override

@@ -3,45 +3,44 @@ conftest.py
 ===========
 Testinfra pytest configuration supporting:
 
-  - Multiple inventory roots (one infra at a time via --infra=infra1)
+  - Multiple inventory roots  (one infra at a time via --infra=infra1)
   - Multi-directory inventory layout:
       inventories/<infra>/
           hosts.ini          <- INI-format Ansible inventory
-          group_vars/        <- YAML files, may be flat or split per-group
-          host_vars/         <- YAML files per host
+          group_vars/        <- flat file or per-group directory
+          host_vars/         <- per-host YAML files
           infra_vars.yml     <- optional infra-level overrides
-  - Multiple roles (--role-roots=role1,role2,role3,role4)
-      All role defaults are treated as equal-weight fallbacks;
-      group_vars beats all role defaults.
+  - Multiple roles  (--role-roots=role1,role2,role3,role4)
+      All role defaults are equal-weight fallbacks;
+      group_vars always beats role defaults.
 
 Variable merge order (lowest → highest priority):
   all role defaults (merged, equal weight)
-    └─▶ group_vars/all.yml          (if present)
+    └─▶ group_vars/all.yml
           └─▶ group_vars/certificate_group.yml
-                └─▶ infra_vars.yml  (infra-level overrides)
-                      └─▶ host_vars/<hostname>.yml  (per-test, not session)
+                └─▶ infra_vars.yml
+                      └─▶ host_vars/<hostname>.yml   (per-test only)
 
-CLI flags (all have env-var fallbacks):
-  --infra         name of the infra under inventories/  (e.g. infra1)
-  --inventories   root folder that contains per-infra subdirs  (default: inventories)
-  --role-roots    comma-separated list of role directories     (default: roles/ipa_cert)
+NOTE ON PARAMETRISATION
+  pytest_generate_tests() here reads hosts.ini at *collection time* using
+  only CLI options (no fixtures).  This is the only correct approach —
+  fixture values are not available during collection, which is why
+  `params=lambda` and `_store` tricks raise TypeError.
 """
 
 import configparser
 import os
 import pathlib
-from typing import Optional
 
 import pytest
 import yaml
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
+# YAML / merge helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_yaml(path: str) -> dict:
-    """Load a YAML file; silently return {} if missing or empty."""
     p = pathlib.Path(path)
     if not p.is_file():
         return {}
@@ -62,58 +61,44 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def _load_group_vars_dir(group_vars_dir: str, group_name: str) -> dict:
     """
-    Load group_vars for *group_name*. Handles two Ansible conventions:
-      1. group_vars/<group_name>.yml          (single file)
-      2. group_vars/<group_name>/             (directory of YAMLs)
-    Also loads group_vars/all.yml / group_vars/all/ as the lowest layer.
+    Load group_vars for *group_name*.
+    Handles: group_vars/<name>.yml  AND  group_vars/<name>/  (directory).
+    Also loads group_vars/all first (lowest layer).
     """
     base = pathlib.Path(group_vars_dir)
     result: dict = {}
 
     def _absorb(target: str) -> None:
         nonlocal result
-        # flat file
         flat = base / f"{target}.yml"
         if flat.is_file():
             result = _deep_merge(result, _load_yaml(str(flat)))
-        # directory of YAML files
         d = base / target
         if d.is_dir():
             for f in sorted(d.glob("*.yml")):
                 result = _deep_merge(result, _load_yaml(str(f)))
 
-    _absorb("all")            # lowest layer — global group_vars
-    _absorb(group_name)       # group-specific layer
+    _absorb("all")
+    _absorb(group_name)
     return result
 
 
 def _load_host_vars(host_vars_dir: str, hostname: str) -> dict:
-    """
-    Load host_vars for *hostname*. Handles:
-      1. host_vars/<hostname>.yml
-      2. host_vars/<hostname>/  (directory of YAMLs)
-    """
+    """Load host_vars/<hostname>.yml or host_vars/<hostname>/."""
     base = pathlib.Path(host_vars_dir)
     result: dict = {}
-
     flat = base / f"{hostname}.yml"
     if flat.is_file():
         result = _deep_merge(result, _load_yaml(str(flat)))
-
     d = base / hostname
     if d.is_dir():
         for f in sorted(d.glob("*.yml")):
             result = _deep_merge(result, _load_yaml(str(f)))
-
     return result
 
 
-def _load_all_role_defaults(role_roots: list[str]) -> dict:
-    """
-    Load defaults/main.yml from every role.  All roles are equal weight —
-    later roles in the list win only on key collision (stable, predictable).
-    group_vars will override everything loaded here.
-    """
+def _load_all_role_defaults(role_roots: list) -> dict:
+    """Merge defaults/main.yml from every role. All roles equal weight."""
     merged: dict = {}
     for role_path in role_roots:
         defaults = _load_yaml(os.path.join(role_path, "defaults", "main.yml"))
@@ -121,43 +106,53 @@ def _load_all_role_defaults(role_roots: list[str]) -> dict:
     return merged
 
 
-def _parse_ini_hosts(hosts_ini_path: str, group: str) -> list[str]:
+# ─────────────────────────────────────────────────────────────────────────────
+# INI inventory parser
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_ini_hosts(hosts_ini_path: str, group: str) -> list:
     """
-    Parse an Ansible INI inventory file and return all hosts under *group*.
-    Handles:
-      - [group] sections with bare hostnames
-      - [group:children] meta-sections (recursively resolved one level)
-      - Ansible host patterns are NOT expanded (use simple hostnames)
+    Parse Ansible INI inventory and return all hosts under *group*.
+    Resolves [group:children] one level deep.
+    Called both at collection time (plain function) and inside fixtures.
     """
     p = pathlib.Path(hosts_ini_path)
     if not p.is_file():
         return []
 
     cfg = configparser.RawConfigParser(allow_no_value=True, delimiters=("=",))
-    cfg.optionxform = str          # preserve case
+    cfg.optionxform = str          # preserve hostname case
     cfg.read(str(p))
 
-    def _section_hosts(section: str) -> list[str]:
+    def _section_hosts(section: str) -> list:
         if not cfg.has_section(section):
             return []
         return [k for k, _ in cfg.items(section)]
 
-    # direct hosts
     hosts = _section_hosts(group)
+    for child in _section_hosts(f"{group}:children"):
+        hosts.extend(_section_hosts(child))
 
-    # hosts from child groups  [group:children]
-    children_section = f"{group}:children"
-    for child_group in _section_hosts(children_section):
-        hosts.extend(_section_hosts(child_group))
-
-    # deduplicate while preserving order
+    # deduplicate, preserve order
     seen: set = set()
-    unique: list[str] = []
+    unique: list = []
     for h in hosts:
         if h not in seen:
             seen.add(h)
             unique.append(h)
     return unique
+
+
+def _find_hosts_ini(infra_dir: str) -> str:
+    """Find the INI inventory file inside an infra directory."""
+    for candidate in ("hosts.ini", "hosts", "inventory.ini", "conf.ini"):
+        p = os.path.join(infra_dir, candidate)
+        if os.path.isfile(p):
+            return p
+    raise FileNotFoundError(
+        f"No INI inventory file found under {infra_dir}. "
+        "Tried: hosts.ini, hosts, inventory.ini, conf.ini"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -168,27 +163,87 @@ def pytest_addoption(parser):
     parser.addoption(
         "--infra",
         default=os.environ.get("INFRA", ""),
-        help="Infra name to test (e.g. infra1). Maps to inventories/<infra>/",
+        help="Infra name to test, e.g. --infra=infra1  (maps to inventories/<infra>/)",
     )
     parser.addoption(
         "--inventories",
         default=os.environ.get("INVENTORIES_ROOT", "inventories"),
-        help="Root folder containing per-infra inventory directories (default: inventories)",
+        help="Root folder containing per-infra inventory subdirectories (default: inventories)",
     )
     parser.addoption(
         "--role-roots",
         default=os.environ.get("ROLE_ROOTS", "roles/ipa_cert"),
         help=(
-            "Comma-separated list of role directories whose defaults/main.yml "
-            "should be loaded (e.g. roles/ipa_cert,roles/ipa_client). "
-            "All role defaults are equal weight; group_vars overrides all."
+            "Comma-separated role directories whose defaults/main.yml are loaded. "
+            "Example: roles/ipa_cert,roles/ipa_client,roles/common_tls"
         ),
     )
     parser.addoption(
         "--cert-group",
         default=os.environ.get("CERT_GROUP", "certificate_group"),
-        help="Ansible group name that contains certificate hosts (default: certificate_group)",
+        help="Ansible group name containing certificate hosts (default: certificate_group)",
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pytest_generate_tests — the ONLY correct place to parametrise with hosts
+#
+# This hook runs at COLLECTION TIME when no fixtures are available yet.
+# We read CLI options directly via metafunc.config.getoption().
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pytest_generate_tests(metafunc):
+    """
+    Inject cert_host parameter for any test that declares it as a fixture.
+    Reads hosts from:
+      1. CERTIFICATE_HOSTS env var (comma-separated)  — highest priority
+      2. hosts.ini parsed for [<cert_group>]
+    """
+    if "cert_host" not in metafunc.fixturenames:
+        return
+
+    # 1. env-var override (useful for quick targeted runs)
+    env_hosts = os.environ.get("CERTIFICATE_HOSTS", "")
+    if env_hosts:
+        hosts = [h.strip() for h in env_hosts.split(",") if h.strip()]
+        metafunc.parametrize("cert_host", hosts, scope="module")
+        return
+
+    # 2. parse hosts.ini at collection time using CLI options only
+    infra      = metafunc.config.getoption("--infra")
+    inv_root   = metafunc.config.getoption("--inventories")
+    cert_group = metafunc.config.getoption("--cert-group")
+
+    if not infra:
+        pytest.exit(
+            "ERROR: --infra is required.\n"
+            "  Example: pytest tests/ --infra=infra1\n"
+            "  Or set:  export INFRA=infra1",
+            returncode=1,
+        )
+
+    infra_dir = os.path.join(inv_root, infra)
+    if not os.path.isdir(infra_dir):
+        pytest.exit(
+            f"ERROR: Inventory directory not found: {infra_dir}\n"
+            f"  Expected: {inv_root}/<infra>/hosts.ini",
+            returncode=1,
+        )
+
+    try:
+        hosts_ini = _find_hosts_ini(infra_dir)
+    except FileNotFoundError as exc:
+        pytest.exit(f"ERROR: {exc}", returncode=1)
+
+    hosts = _parse_ini_hosts(hosts_ini, cert_group)
+    if not hosts:
+        pytest.exit(
+            f"ERROR: No hosts found under [{cert_group}] in {hosts_ini}.\n"
+            "  Check your inventory or set CERTIFICATE_HOSTS env var.",
+            returncode=1,
+        )
+
+    metafunc.parametrize("cert_host", hosts, scope="module")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -198,10 +253,7 @@ def pytest_addoption(parser):
 @pytest.fixture(scope="session")
 def infra_name(request) -> str:
     name = request.config.getoption("--infra")
-    assert name, (
-        "--infra is required. Example: pytest tests/ --infra=infra1\n"
-        "Or set the INFRA environment variable."
-    )
+    assert name, "--infra is required (or set INFRA env var)"
     return name
 
 
@@ -212,26 +264,15 @@ def inventories_root(request) -> str:
 
 @pytest.fixture(scope="session")
 def infra_inventory_dir(infra_name, inventories_root) -> str:
-    """Absolute path to inventories/<infra>/"""
     d = os.path.join(inventories_root, infra_name)
-    assert os.path.isdir(d), (
-        f"Inventory directory not found: {d}\n"
-        f"Expected structure: {inventories_root}/<infra>/hosts.ini"
-    )
+    assert os.path.isdir(d), f"Inventory directory not found: {d}"
     return d
 
 
 @pytest.fixture(scope="session")
-def role_roots(request) -> list[str]:
-    """List of role root paths parsed from --role-roots."""
+def role_roots(request) -> list:
     raw = request.config.getoption("--role-roots")
-    roots = [r.strip() for r in raw.split(",") if r.strip()]
-    missing = [r for r in roots if not os.path.isdir(r)]
-    if missing:
-        pytest.warnings.warn(
-            f"Role directories not found (defaults skipped): {missing}"
-        )
-    return roots
+    return [r.strip() for r in raw.split(",") if r.strip()]
 
 
 @pytest.fixture(scope="session")
@@ -241,16 +282,7 @@ def cert_group_name(request) -> str:
 
 @pytest.fixture(scope="session")
 def hosts_ini_path(infra_inventory_dir) -> str:
-    """Path to the hosts.ini file inside the infra inventory dir."""
-    candidates = ["hosts.ini", "hosts", "inventory.ini", "conf.ini"]
-    for c in candidates:
-        p = os.path.join(infra_inventory_dir, c)
-        if os.path.isfile(p):
-            return p
-    raise FileNotFoundError(
-        f"No INI inventory file found under {infra_inventory_dir}. "
-        f"Tried: {candidates}"
-    )
+    return _find_hosts_ini(infra_inventory_dir)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,35 +291,25 @@ def hosts_ini_path(infra_inventory_dir) -> str:
 
 @pytest.fixture(scope="session")
 def all_role_defaults(role_roots) -> dict:
-    """
-    Merge defaults/main.yml from all roles.
-    All roles are equal weight — this is the lowest-priority layer.
-    """
+    """Merge defaults/main.yml from all roles. Equal weight, lowest priority."""
     return _load_all_role_defaults(role_roots)
 
 
 @pytest.fixture(scope="session")
 def group_vars_data(infra_inventory_dir, cert_group_name) -> dict:
-    """
-    Load group_vars for 'all' and 'certificate_group' from the infra inventory.
-    Handles both flat-file and directory-per-group conventions.
-    """
+    """Load group_vars/all + group_vars/certificate_group from the infra dir."""
     gv_dir = os.path.join(infra_inventory_dir, "group_vars")
     return _load_group_vars_dir(gv_dir, cert_group_name)
 
 
 @pytest.fixture(scope="session")
 def infra_vars_data(infra_inventory_dir) -> dict:
-    """
-    Load optional infra-level variable overrides.
-    Looks for infra_vars.yml (or infra_vars/main.yml) in the infra dir.
-    """
-    candidates = [
+    """Load optional infra_vars.yml (infra-level overrides)."""
+    for candidate in (
         os.path.join(infra_inventory_dir, "infra_vars.yml"),
         os.path.join(infra_inventory_dir, "infra_vars", "main.yml"),
-    ]
-    for c in candidates:
-        data = _load_yaml(c)
+    ):
+        data = _load_yaml(candidate)
         if data:
             return data
     return {}
@@ -296,32 +318,24 @@ def infra_vars_data(infra_inventory_dir) -> dict:
 @pytest.fixture(scope="session")
 def merged_vars(all_role_defaults, group_vars_data, infra_vars_data) -> dict:
     """
-    Final merged variable dict (session-scoped, no host_vars applied yet).
-
-    Merge order (lowest → highest):
-      all role defaults
-        └─▶ group_vars/all  +  group_vars/certificate_group
-              └─▶ infra_vars.yml
-
-    host_vars are applied per-test via host_merged_vars_for().
+    Session-level merged variable dict (no host_vars yet).
+    Merge order: role defaults < group_vars/all < group_vars/<group> < infra_vars
     """
     base = _deep_merge(all_role_defaults, group_vars_data)
     return _deep_merge(base, infra_vars_data)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public helper: apply host_vars on top of session merged_vars
+# Public helper — apply host_vars per test
 # ─────────────────────────────────────────────────────────────────────────────
 
 def host_merged_vars_for(hostname: str, infra_inventory_dir: str, base_vars: dict) -> dict:
     """
-    Return the fully merged variable dict for a specific host.
+    Apply host_vars/<hostname> on top of the session-level merged_vars.
+    Call this inside individual tests that need per-host variable overrides:
 
-    Precedence (lowest → highest):
-      all role defaults < group_vars < infra_vars < host_vars/<hostname>
-
-    Call this inside tests that need per-host variable overrides:
-        vars = host_merged_vars_for(cert_host, infra_inventory_dir, merged_vars)
+        hvars = host_merged_vars_for(cert_host, infra_inventory_dir, merged_vars)
+        owner = hvars.get("cert_owner", cert_owner)
     """
     hv_dir = os.path.join(infra_inventory_dir, "host_vars")
     hv = _load_host_vars(hv_dir, hostname)
@@ -329,30 +343,7 @@ def host_merged_vars_for(hostname: str, infra_inventory_dir: str, base_vars: dic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Host discovery fixture
-# ─────────────────────────────────────────────────────────────────────────────
-
-@pytest.fixture(scope="session")
-def certificate_hosts(hosts_ini_path, cert_group_name, merged_vars) -> list[str]:
-    """
-    Ordered list of hostnames in the certificate_group.
-    Discovery order:
-      1. CERTIFICATE_HOSTS env var (comma-separated) — highest priority
-      2. hosts.ini parsed for [certificate_group]
-    """
-    env_hosts = os.environ.get("CERTIFICATE_HOSTS", "")
-    if env_hosts:
-        return [h.strip() for h in env_hosts.split(",") if h.strip()]
-    hosts = _parse_ini_hosts(hosts_ini_path, cert_group_name)
-    assert hosts, (
-        f"No hosts found under [{cert_group_name}] in {hosts_ini_path}.\n"
-        f"Check your inventory or set CERTIFICATE_HOSTS env var."
-    )
-    return hosts
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Derived variable fixtures  (all read from merged_vars)
+# Derived variable fixtures
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
@@ -360,7 +351,7 @@ def cert_base_dir(merged_vars) -> str:
     return merged_vars.get("cert_base_dir", "/data/certificates")
 
 @pytest.fixture(scope="session")
-def cert_types(merged_vars) -> list[str]:
+def cert_types(merged_vars) -> list:
     return merged_vars.get("cert_types", ["client", "server"])
 
 @pytest.fixture(scope="session")
@@ -402,23 +393,34 @@ def ipaclient_host_name(merged_vars) -> str:
         or os.environ.get("IPACLIENT_HOST", "")
     )
 
+@pytest.fixture(scope="session")
+def certificate_hosts(hosts_ini_path, cert_group_name) -> list:
+    """
+    Session fixture version of the host list (used in test_ipaclient.py etc.
+    where cert_host parametrisation is not needed but the list is).
+    """
+    env_hosts = os.environ.get("CERTIFICATE_HOSTS", "")
+    if env_hosts:
+        return [h.strip() for h in env_hosts.split(",") if h.strip()]
+    return _parse_ini_hosts(hosts_ini_path, cert_group_name)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Debug fixture — print the resolved variable set at session start
+# Debug — print resolved config at session start
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session", autouse=True)
 def _print_resolved_config(
-    infra_name, role_roots, merged_vars, certificate_hosts, cert_base_dir,
-    ipa_realm, ipa_domain, ipaclient_host_name
+    infra_name, role_roots, merged_vars,
+    certificate_hosts, cert_base_dir,
+    ipa_realm, ipa_domain, ipaclient_host_name,
 ):
-    """Print a summary of resolved variables so failures are easy to diagnose."""
-    print("\n" + "═" * 60)
-    print(f"  INFRA             : {infra_name}")
-    print(f"  ROLE ROOTS        : {role_roots}")
-    print(f"  CERT HOSTS        : {certificate_hosts}")
-    print(f"  CERT BASE DIR     : {cert_base_dir}")
-    print(f"  IPA REALM         : {ipa_realm or '(not set)'}")
-    print(f"  IPA DOMAIN        : {ipa_domain or '(not set)'}")
-    print(f"  IPACLIENT HOST    : {ipaclient_host_name or '(not set)'}")
-    print("═" * 60 + "\n")
+    print("\n" + "═" * 64)
+    print(f"  INFRA          : {infra_name}")
+    print(f"  ROLE ROOTS     : {role_roots}")
+    print(f"  CERT HOSTS     : {certificate_hosts}")
+    print(f"  CERT BASE DIR  : {cert_base_dir}")
+    print(f"  IPA REALM      : {ipa_realm  or '(not set)'}")
+    print(f"  IPA DOMAIN     : {ipa_domain or '(not set)'}")
+    print(f"  IPACLIENT HOST : {ipaclient_host_name or '(not set)'}")
+    print("═" * 64 + "\n")

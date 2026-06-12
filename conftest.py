@@ -1,46 +1,149 @@
 """
 conftest.py
 ===========
-Testinfra pytest configuration supporting:
+Senior-level, modular testinfra configuration.
 
-  - Multiple inventory roots  (one infra at a time via --infra=infra1)
-  - Multi-directory inventory layout:
-      inventories/<infra>/
-          hosts.ini          <- INI-format Ansible inventory
-          group_vars/        <- flat file or per-group directory
-          host_vars/         <- per-host YAML files
-          infra_vars.yml     <- optional infra-level overrides
-  - Multiple roles  (--role-roots=role1,role2,role3,role4)
-      All role defaults are equal-weight fallbacks;
-      group_vars always beats role defaults.
+DESIGN PHILOSOPHY
+─────────────────
+Ansible already knows how to parse inventories, merge host_vars,
+group_vars, role defaults and apply precedence correctly.
+Re-implementing that in Python is fragile and always wrong at the edges.
 
-Variable merge order (lowest → highest priority):
-  all role defaults (merged, equal weight)
-    └─▶ group_vars/all.yml
-          └─▶ group_vars/certificate_group.yml
-                └─▶ infra_vars.yml
-                      └─▶ host_vars/<hostname>.yml   (per-test only)
+Instead this conftest delegates ALL variable and inventory resolution
+back to Ansible via two CLI calls:
 
-NOTE ON PARAMETRISATION
-  pytest_generate_tests() here reads hosts.ini at *collection time* using
-  only CLI options (no fixtures).  This is the only correct approach —
-  fixture values are not available during collection, which is why
-  `params=lambda` and `_store` tricks raise TypeError.
+  ansible-inventory --list          → full inventory + merged hostvars
+  ansible <host> -m debug -a var=x  → resolve any variable for any host
+
+This means:
+  - host_vars, group_vars, role vars, extra_vars all resolve correctly
+  - ansible_host, ansible_user, ansible_become_pass all available
+  - Adding a new test file = add one fixture, no INI parsing changes
+  - Variables per testcase = just request the right host fixture
+
+FIXTURES OVERVIEW
+─────────────────
+  inventory         — full parsed inventory (dict)
+  hostvars(host)    — all merged vars for a specific host (dict)
+  group_hosts(grp)  — list of HostEntry for a group
+  cert_hosts        — HostEntry list for --cert-group
+  ipaclient_hosts   — HostEntry list for --ipaclient-group
+  sudo_password     — read from keypass.yml (plain YAML)
+  local_connection  — testinfra local:// backend
+
+PYTEST HOOKS
+────────────
+  pytest_generate_tests — parametrises cert_host per test file
+                          using _FILE_TO_GROUP_OPTION mapping
+
+CLI OPTIONS
+───────────
+  --infra            infra name  (maps to inventories/<infra>/)
+  --inventories      root of inventory directories
+  --role-roots       comma-separated role paths (for defaults)
+  --cert-group       group name for cert hosts
+  --ipaclient-group  group name for ipaclient host
+  --localhost-group  group name for localhost/controller
 """
 
-import configparser
+from __future__ import annotations
+
+import json
 import os
 import pathlib
+import re
+import shutil
+import subprocess
+from collections import namedtuple
+from typing import Any
 
 import pytest
 import yaml
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# YAML / merge helpers
+# Types
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HostEntry(namedtuple("HostEntry", ["short_name", "ssh_target"])):
+    """
+    Represents one host from the inventory.
+
+    short_name : inventory hostname (used for cert paths, display)
+    ssh_target : resolvable address for SSH  (ansible_host IP or FQDN from cert_cn)
+    """
+    def __repr__(self):
+        return self.short_name
+
+
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class FilePerms:
+    """
+    Expected ownership and permissions for a file on a specific host.
+    Resolved from inventory hostvars so each host/role can have
+    different values — e.g. cert hosts vs ipaclient host.
+
+    Usage in a test:
+        perms = FilePerms.for_host(inventory, cert_host.short_name, "csr")
+        f = ssh_host.file(path)
+        assert f.user  == perms.owner
+        assert f.group == perms.group
+        assert f.mode  == perms.mode_int
+    """
+    owner    : str
+    group    : str
+    mode_str : str   # e.g. "0644"
+
+    @property
+    def mode_int(self) -> int:
+        return int(self.mode_str, 8)
+
+    @classmethod
+    def for_host(
+        cls,
+        inventory: "AnsibleInventory",
+        hostname: str,
+        file_type: str = "csr",   # "csr" | "crt" | "key" | "dir"
+    ) -> "FilePerms":
+        """
+        Resolve permissions for *file_type* on *hostname*.
+
+        Variable lookup per file_type:
+          "csr"  → cert_owner, cert_group, cert_file_mode   (default 0644)
+          "crt"  → cert_owner, cert_group, cert_file_mode   (default 0644)
+          "key"  → cert_owner, cert_group, key_file_mode    (default 0600)
+          "dir"  → cert_owner, cert_group, cert_dir_mode    (default 0755)
+
+        All values read from fully merged hostvars so host_vars, group_vars,
+        and role defaults are all respected with correct Ansible precedence.
+        """
+        hv = inventory.hostvars(hostname)
+
+        owner = hv.get("cert_owner", "root")
+        group = hv.get("cert_group", "root")
+
+        mode_key = {
+            "key": "key_file_mode",
+            "dir": "cert_dir_mode",
+        }.get(file_type, "cert_file_mode")
+
+        default_mode = {
+            "key": "0600",
+            "dir": "0755",
+        }.get(file_type, "0644")
+
+        mode = hv.get(mode_key, default_mode)
+        return cls(owner=owner, group=group, mode_str=mode)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Low-level helpers — plain Python, no Ansible dependency
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _load_yaml(path: str) -> dict:
+    """Load a YAML file; return {} if missing or empty."""
     p = pathlib.Path(path)
     if not p.is_file():
         return {}
@@ -49,7 +152,7 @@ def _load_yaml(path: str) -> dict:
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge *override* into a copy of *base*. Override wins."""
+    """Recursively merge override into base. Override wins on conflict."""
     result = base.copy()
     for k, v in override.items():
         if isinstance(v, dict) and isinstance(result.get(k), dict):
@@ -59,201 +162,396 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def _load_group_vars_dir(group_vars_dir: str, group_name: str) -> dict:
+# ─────────────────────────────────────────────────────────────────────────────
+# Ansible CLI bridge
+# ─────────────────────────────────────────────────────────────────────────────
+
+class AnsibleInventory:
     """
-    Load group_vars for *group_name*.
-    Handles: group_vars/<name>.yml  AND  group_vars/<name>/  (directory).
-    Also loads group_vars/all first (lowest layer).
+    Wraps `ansible-inventory --list` to give Python access to the full
+    inventory exactly as Ansible sees it — host_vars, group_vars, role
+    defaults all merged with correct precedence.
+
+    Usage:
+        inv = AnsibleInventory("inventories/infra1", "roles/ipa_cert,roles/ipa_client")
+        hosts = inv.group_hosts("ipa_client")     # ["host1", "host2"]
+        vars  = inv.hostvars("host1")             # full merged var dict
+        val   = inv.var("host1", "cert_cn")       # single variable value
     """
-    base = pathlib.Path(group_vars_dir)
-    result: dict = {}
 
-    def _absorb(target: str) -> None:
-        nonlocal result
-        flat = base / f"{target}.yml"
-        if flat.is_file():
-            result = _deep_merge(result, _load_yaml(str(flat)))
-        d = base / target
-        if d.is_dir():
-            for f in sorted(d.glob("*.yml")):
-                result = _deep_merge(result, _load_yaml(str(f)))
+    def __init__(self, infra_dir: str, role_roots: str = ""):
+        self._infra_dir  = infra_dir
+        self._role_roots = role_roots
+        self._cache: dict | None = None
 
-    _absorb("all")
-    _absorb(group_name)
-    return result
+    # ── internal ──────────────────────────────────────────────────────────────
 
+    def _env(self) -> dict:
+        """Build subprocess env with ANSIBLE_ROLES_PATH set."""
+        env = os.environ.copy()
+        if self._role_roots:
+            # ansible-inventory uses ANSIBLE_ROLES_PATH to find role defaults
+            role_paths = ":".join(
+                str(pathlib.Path(r.strip()).parent)
+                for r in self._role_roots.split(",")
+                if r.strip()
+            )
+            env["ANSIBLE_ROLES_PATH"] = role_paths
+        # Suppress deprecation noise
+        env.setdefault("ANSIBLE_DEPRECATION_WARNINGS", "False")
+        env.setdefault("ANSIBLE_SYSTEM_WARNINGS",      "False")
+        return env
 
-def _load_host_vars(host_vars_dir: str, hostname: str) -> dict:
-    """Load host_vars/<hostname>.yml or host_vars/<hostname>/."""
-    base = pathlib.Path(host_vars_dir)
-    result: dict = {}
-    flat = base / f"{hostname}.yml"
-    if flat.is_file():
-        result = _deep_merge(result, _load_yaml(str(flat)))
-    d = base / hostname
-    if d.is_dir():
-        for f in sorted(d.glob("*.yml")):
-            result = _deep_merge(result, _load_yaml(str(f)))
-    return result
+    def _inventory_file(self) -> str:
+        """Find conf.ini / hosts.ini inside the infra directory."""
+        for candidate in ("conf.ini", "hosts.ini", "hosts", "inventory.ini"):
+            p = os.path.join(self._infra_dir, candidate)
+            if os.path.isfile(p):
+                return p
+        raise FileNotFoundError(
+            f"No inventory file found under {self._infra_dir}. "
+            "Tried: conf.ini, hosts.ini, hosts, inventory.ini"
+        )
 
+    def _raw(self) -> dict:
+        """
+        Run `ansible-inventory --list` and return the parsed JSON.
+        Result is cached for the lifetime of this object.
+        """
+        if self._cache is not None:
+            return self._cache
 
-def _load_all_role_defaults(role_roots: list) -> dict:
-    """Merge defaults/main.yml from every role. All roles equal weight."""
-    merged: dict = {}
-    for role_path in role_roots:
-        defaults = _load_yaml(os.path.join(role_path, "defaults", "main.yml"))
-        merged = _deep_merge(merged, defaults)
-    return merged
+        if not shutil.which("ansible-inventory"):
+            # ansible-inventory not available — fall back to manual parsing
+            self._cache = {}
+            return self._cache
+
+        inv_file = self._inventory_file()
+        result = subprocess.run(
+            ["ansible-inventory", "-i", inv_file, "--list"],
+            capture_output=True,
+            text=True,
+            env=self._env(),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ansible-inventory failed for {inv_file}:\n{result.stderr}"
+            )
+        self._cache = json.loads(result.stdout)
+        return self._cache
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def group_hosts(self, group: str) -> list[str]:
+        """
+        Return all hostnames in *group* (children resolved).
+        Falls back to manual INI parsing if ansible-inventory is unavailable.
+        """
+        raw = self._raw()
+        if raw:
+            grp_data = raw.get(group, {})
+            hosts = list(grp_data.get("hosts", []))
+            for child in grp_data.get("children", []):
+                hosts.extend(self.group_hosts(child))
+            # deduplicate
+            seen, unique = set(), []
+            for h in hosts:
+                if h not in seen:
+                    seen.add(h); unique.append(h)
+            return unique
+        # fallback
+        return self._manual_group_hosts(group)
+
+    def hostvars(self, hostname: str) -> dict:
+        """
+        Return the fully merged variable dict for *hostname* exactly as
+        Ansible resolves it (host_vars > group_vars > role defaults).
+        """
+        raw = self._raw()
+        if raw:
+            return raw.get("_meta", {}).get("hostvars", {}).get(hostname, {})
+        # fallback — manual merge
+        return self._manual_hostvars(hostname)
+
+    def var(self, hostname: str, varname: str, default: Any = None) -> Any:
+        """Convenience: get a single variable for a host."""
+        return self.hostvars(hostname).get(varname, default)
+
+    def all_hostvars(self) -> dict[str, dict]:
+        """Return {hostname: vars_dict} for every host in the inventory."""
+        raw = self._raw()
+        if raw:
+            return raw.get("_meta", {}).get("hostvars", {})
+        return {}
+
+    # ── fallback: manual parsing when ansible-inventory is unavailable ────────
+
+    def _manual_group_hosts(self, group: str) -> list[str]:
+        """Plain-text INI parser — used when ansible-inventory is absent."""
+        inv_file = self._inventory_file()
+        sections: dict = {}
+        current = None
+        section_re = re.compile(r"^\[(.+?)\]\s*$")
+
+        for raw_line in pathlib.Path(inv_file).read_text(
+            encoding="utf-8", errors="replace"
+        ).replace("\r\n", "\n").replace("\r", "\n").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            m = section_re.match(line)
+            if m:
+                header = re.sub(r"\s*:\s*", ":", m.group(1)).strip()
+                current = header
+                sections.setdefault(current, [])
+                continue
+            if current is None:
+                continue
+            short_name = line.split()[0]
+            ip_match   = re.search(r"ansible_host=(\S+)", line)
+            ansible_host = ip_match.group(1) if ip_match else short_name
+            sections[current].append((short_name, ansible_host))
+
+        def _in(sec):
+            return sections.get(sec, [])
+
+        entries = list(_in(group))
+        for child_entry in _in(f"{group}:children"):
+            child_name = child_entry[0] if isinstance(child_entry, tuple) else child_entry
+            entries.extend(_in(child_name))
+
+        exclude = {"localhost", "127.0.0.1"}
+        seen, unique = set(), []
+        for entry in entries:
+            short, _ = entry if isinstance(entry, tuple) else (entry, entry)
+            if short not in seen and short not in exclude:
+                seen.add(short); unique.append(short)
+        return unique
+
+    def _manual_hostvars(self, hostname: str) -> dict:
+        """
+        Manual variable merge when ansible-inventory is unavailable.
+        Merges: role defaults < group_vars < host_vars
+        """
+        # role defaults
+        merged: dict = {}
+        for role_root in (r.strip() for r in self._role_roots.split(",") if r.strip()):
+            defaults = _load_yaml(os.path.join(role_root, "defaults", "main.yml"))
+            merged   = _deep_merge(merged, defaults)
+
+        # group_vars/all
+        gv_dir = os.path.join(self._infra_dir, "group_vars")
+        for target in ("all", ):
+            flat = pathlib.Path(gv_dir) / f"{target}.yml"
+            if flat.is_file():
+                merged = _deep_merge(merged, _load_yaml(str(flat)))
+            d = pathlib.Path(gv_dir) / target
+            if d.is_dir():
+                for f in sorted(d.glob("*.yml")):
+                    merged = _deep_merge(merged, _load_yaml(str(f)))
+
+        # group_vars for every group the host belongs to
+        for grp_name, entries in self._manual_sections().items():
+            if hostname in [e[0] if isinstance(e, tuple) else e for e in entries]:
+                for target in (grp_name,):
+                    flat = pathlib.Path(gv_dir) / f"{target}.yml"
+                    if flat.is_file():
+                        merged = _deep_merge(merged, _load_yaml(str(flat)))
+
+        # host_vars
+        hv_dir = pathlib.Path(self._infra_dir) / "host_vars"
+        for candidate in (
+            hv_dir / f"{hostname}.yml",
+            hv_dir / hostname / "main.yml",
+        ):
+            if candidate.is_file():
+                merged = _deep_merge(merged, _load_yaml(str(candidate)))
+
+        return merged
+
+    def _manual_sections(self) -> dict:
+        """Parse all sections from INI for group membership detection."""
+        inv_file = self._inventory_file()
+        sections: dict = {}
+        current = None
+        section_re = re.compile(r"^\[(.+?)\]\s*$")
+        for raw_line in pathlib.Path(inv_file).read_text(
+            encoding="utf-8", errors="replace"
+        ).replace("\r\n", "\n").replace("\r", "\n").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")):
+                continue
+            m = section_re.match(line)
+            if m:
+                current = re.sub(r"\s*:\s*", ":", m.group(1)).strip()
+                sections.setdefault(current, [])
+                continue
+            if current:
+                short = line.split()[0]
+                ip_m  = re.search(r"ansible_host=(\S+)", line)
+                sections[current].append((short, ip_m.group(1) if ip_m else short))
+        return sections
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INI inventory parser
+# SSH target resolution
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_ini_hosts(hosts_ini_path: str, group: str) -> list:
+def _resolve_ssh_target(short_name: str, hostvars: dict) -> str:
     """
-    Parse Ansible INI inventory and return all hosts under *group*.
-    Resolves [group:children] one level deep.
-    Called both at collection time (plain function) and inside fixtures.
+    Determine the SSH address for a host using its fully merged hostvars.
+
+    Priority:
+      1. cert_cn          — FQDN used in certificate Subject CN
+      2. ansible_host     — IP or hostname from inventory
+      3. short_name       — inventory name (may not resolve in DNS)
     """
-    p = pathlib.Path(hosts_ini_path)
-    if not p.is_file():
-        return []
-
-    cfg = configparser.RawConfigParser(allow_no_value=True, delimiters=("=",))
-    cfg.optionxform = str          # preserve hostname case
-    cfg.read(str(p))
-
-    def _section_hosts(section: str) -> list:
-        if not cfg.has_section(section):
-            return []
-        return [k for k, _ in cfg.items(section)]
-
-    hosts = _section_hosts(group)
-    for child in _section_hosts(f"{group}:children"):
-        hosts.extend(_section_hosts(child))
-
-    # deduplicate, preserve order
-    seen: set = set()
-    unique: list = []
-    for h in hosts:
-        if h not in seen:
-            seen.add(h)
-            unique.append(h)
-    return unique
-
-
-def _find_hosts_ini(infra_dir: str) -> str:
-    """Find the INI inventory file inside an infra directory."""
-    for candidate in ("hosts.ini", "hosts", "inventory.ini", "conf.ini"):
-        p = os.path.join(infra_dir, candidate)
-        if os.path.isfile(p):
-            return p
-    raise FileNotFoundError(
-        f"No INI inventory file found under {infra_dir}. "
-        "Tried: hosts.ini, hosts, inventory.ini, conf.ini"
-    )
+    cert_cn = hostvars.get("cert_cn", "")
+    if cert_cn:
+        # cert_cn may be a template e.g. "{hostname}.example.com"
+        cert_cn = cert_cn.replace("{hostname}", short_name)
+        cert_cn = cert_cn.replace("{inventory_hostname}", short_name)
+        return cert_cn
+    return hostvars.get("ansible_host", short_name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CLI options
+# Test file → host group mapping
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Edit this dict to control which host group each test file runs against.
+# Value is the CLI option name whose value is the conf.ini group name.
+#
+# To run a test file on localhost:
+#   change its value to "--localhost-group"
+# To add a new test file:
+#   add one line here — no other changes needed
+# ─────────────────────────────────────────────────────────────────────────────
+
+FILE_TO_GROUP: dict[str, str] = {
+    "test_csr_and_key_generation": "--cert-group",
+    "test_certificate_signed":     "--cert-group",
+    "test_copy_to_ipaclient":      "--cert-group",
+    "test_ipaclient":              "--ipaclient-group",
+    # "test_something_local":      "--localhost-group",
+}
+
+# Env-var that overrides host list per group option
+GROUP_TO_ENVVAR: dict[str, str] = {
+    "--cert-group":      "CERTIFICATE_HOSTS",
+    "--ipaclient-group": "IPACLIENT_HOSTS",
+    "--localhost-group": "LOCALHOST_HOSTS",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# pytest CLI options
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pytest_addoption(parser):
     parser.addoption(
         "--infra",
         default=os.environ.get("INFRA", ""),
-        help="Infra name to test, e.g. --infra=infra1  (maps to inventories/<infra>/)",
+        help="Infra name, e.g. --infra=infra1  (maps to inventories/<infra>/)",
     )
     parser.addoption(
         "--inventories",
         default=os.environ.get("INVENTORIES_ROOT", "inventories"),
-        help="Root folder containing per-infra inventory subdirectories (default: inventories)",
+        help="Root folder containing per-infra inventory directories (default: inventories)",
     )
     parser.addoption(
         "--role-roots",
         default=os.environ.get("ROLE_ROOTS", "roles/ipa_cert"),
-        help=(
-            "Comma-separated role directories whose defaults/main.yml are loaded. "
-            "Example: roles/ipa_cert,roles/ipa_client,roles/common_tls"
-        ),
+        help="Comma-separated role directories for variable defaults",
     )
     parser.addoption(
         "--cert-group",
-        default=os.environ.get("CERT_GROUP", "certificate_group"),
-        help="Ansible group name containing certificate hosts (default: certificate_group)",
+        default=os.environ.get("CERT_GROUP", "ipa_client"),
+        help="Inventory group for certificate hosts (default: ipa_client)",
+    )
+    parser.addoption(
+        "--ipaclient-group",
+        default=os.environ.get("IPACLIENT_GROUP", "ipaclient_server"),
+        help="Inventory group for the IPAclient server (default: ipaclient_server)",
+    )
+    parser.addoption(
+        "--localhost-group",
+        default=os.environ.get("LOCALHOST_GROUP", "localhost"),
+        help="Inventory group for localhost/controller (default: localhost)",
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# pytest_generate_tests — the ONLY correct place to parametrise with hosts
-#
-# This hook runs at COLLECTION TIME when no fixtures are available yet.
-# We read CLI options directly via metafunc.config.getoption().
+# pytest_generate_tests — collection-time host parametrisation
 # ─────────────────────────────────────────────────────────────────────────────
 
 def pytest_generate_tests(metafunc):
     """
-    Inject cert_host parameter for any test that declares it as a fixture.
-    Reads hosts from:
-      1. CERTIFICATE_HOSTS env var (comma-separated)  — highest priority
-      2. hosts.ini parsed for [<cert_group>]
+    Parametrise cert_host for tests that declare it as a fixture.
+    Uses FILE_TO_GROUP to pick the right inventory group per test file.
+    All variable resolution goes through AnsibleInventory so Ansible's
+    own precedence rules are respected.
     """
     if "cert_host" not in metafunc.fixturenames:
         return
 
-    # 1. env-var override (useful for quick targeted runs)
-    env_hosts = os.environ.get("CERTIFICATE_HOSTS", "")
+    # ── which group does this test file target? ───────────────────────────────
+    test_file    = metafunc.module.__name__
+    group_option = FILE_TO_GROUP.get(test_file, "--cert-group")
+    env_var      = GROUP_TO_ENVVAR.get(group_option, "CERTIFICATE_HOSTS")
+
+    # ── env-var override ──────────────────────────────────────────────────────
+    env_hosts = os.environ.get(env_var, "")
     if env_hosts:
-        hosts = [h.strip() for h in env_hosts.split(",") if h.strip()]
-        metafunc.parametrize("cert_host", hosts, scope="module")
+        entries = []
+        for entry in env_hosts.split(","):
+            entry = entry.strip()
+            short, ssh = entry.split(":", 1) if ":" in entry else (entry, entry)
+            entries.append(HostEntry(short_name=short, ssh_target=ssh))
+        metafunc.parametrize("cert_host", entries, scope="module")
         return
 
-    # 2. parse hosts.ini at collection time using CLI options only
+    # ── resolve from inventory ────────────────────────────────────────────────
     infra      = metafunc.config.getoption("--infra")
     inv_root   = metafunc.config.getoption("--inventories")
-    cert_group = metafunc.config.getoption("--cert-group")
+    role_roots = metafunc.config.getoption("--role-roots")
+    group_name = metafunc.config.getoption(group_option)
 
     if not infra:
-        pytest.exit(
-            "ERROR: --infra is required.\n"
-            "  Example: pytest tests/ --infra=infra1\n"
-            "  Or set:  export INFRA=infra1",
-            returncode=1,
-        )
+        pytest.exit("ERROR: --infra is required. Example: --infra=infra1", returncode=1)
 
     infra_dir = os.path.join(inv_root, infra)
     if not os.path.isdir(infra_dir):
-        pytest.exit(
-            f"ERROR: Inventory directory not found: {infra_dir}\n"
-            f"  Expected: {inv_root}/<infra>/hosts.ini",
-            returncode=1,
-        )
+        pytest.exit(f"ERROR: Inventory directory not found: {infra_dir}", returncode=1)
 
-    try:
-        hosts_ini = _find_hosts_ini(infra_dir)
-    except FileNotFoundError as exc:
-        pytest.exit(f"ERROR: {exc}", returncode=1)
+    inv  = AnsibleInventory(infra_dir, role_roots)
+    hosts = inv.group_hosts(group_name)
 
-    hosts = _parse_ini_hosts(hosts_ini, cert_group)
     if not hosts:
         pytest.exit(
-            f"ERROR: No hosts found under [{cert_group}] in {hosts_ini}.\n"
-            "  Check your inventory or set CERTIFICATE_HOSTS env var.",
+            f"ERROR: No hosts found under [{group_name}]. "
+            f"Check inventory or set {env_var} env var.",
             returncode=1,
         )
 
-    metafunc.parametrize("cert_host", hosts, scope="module")
+    entries = [
+        HostEntry(
+            short_name=h,
+            ssh_target=_resolve_ssh_target(h, inv.hostvars(h)),
+        )
+        for h in hosts
+    ]
+    metafunc.parametrize("cert_host", entries, scope="module")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Path fixtures
+# Core session fixtures
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
 def infra_name(request) -> str:
     name = request.config.getoption("--infra")
-    assert name, "--infra is required (or set INFRA env var)"
+    assert name, "--infra is required"
     return name
 
 
@@ -263,16 +561,52 @@ def inventories_root(request) -> str:
 
 
 @pytest.fixture(scope="session")
-def infra_inventory_dir(infra_name, inventories_root) -> str:
+def infra_dir(infra_name, inventories_root) -> str:
     d = os.path.join(inventories_root, infra_name)
     assert os.path.isdir(d), f"Inventory directory not found: {d}"
     return d
 
 
 @pytest.fixture(scope="session")
-def role_roots(request) -> list:
-    raw = request.config.getoption("--role-roots")
-    return [r.strip() for r in raw.split(",") if r.strip()]
+def role_roots(request) -> str:
+    return request.config.getoption("--role-roots")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AnsibleInventory fixture — the central access point for all tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def inventory(infra_dir, role_roots) -> AnsibleInventory:
+    """
+    Session-scoped AnsibleInventory instance.
+    Use this in any test to get variables, host lists, or single var values.
+
+    Examples in a test:
+        def test_something(inventory, cert_host):
+            vars  = inventory.hostvars(cert_host.short_name)
+            owner = inventory.var(cert_host.short_name, "cert_owner", "root")
+            hosts = inventory.group_hosts("ipa_client")
+    """
+    return AnsibleInventory(infra_dir, role_roots)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience variable fixtures — derived from inventory
+# All read from the fully merged hostvars so precedence is correct.
+# These are session-scoped defaults; use inventory.var(host, key) for
+# per-host values that may differ between hosts.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _group_var(inventory: AnsibleInventory, group: str, key: str, default: Any = None) -> Any:
+    """
+    Get a variable value using the first host in a group as representative.
+    Group-level vars are the same for all hosts so any host works.
+    """
+    hosts = inventory.group_hosts(group)
+    if not hosts:
+        return default
+    return inventory.var(hosts[0], key, default)
 
 
 @pytest.fixture(scope="session")
@@ -281,128 +615,110 @@ def cert_group_name(request) -> str:
 
 
 @pytest.fixture(scope="session")
-def hosts_ini_path(infra_inventory_dir) -> str:
-    return _find_hosts_ini(infra_inventory_dir)
+def ipaclient_group_name(request) -> str:
+    return request.config.getoption("--ipaclient-group")
+
+
+@pytest.fixture(scope="session")
+def cert_base_dir(inventory, cert_group_name) -> str:
+    return _group_var(inventory, cert_group_name, "cert_base_dir", "/data/certificates")
+
+
+@pytest.fixture(scope="session")
+def cert_types(inventory, cert_group_name) -> list:
+    return _group_var(inventory, cert_group_name, "cert_types", ["client", "server"])
+
+
+@pytest.fixture(scope="session")
+def ipa_realm(inventory, cert_group_name) -> str:
+    return _group_var(inventory, cert_group_name, "ipa_realm", "")
+
+
+@pytest.fixture(scope="session")
+def ipa_domain(inventory, cert_group_name) -> str:
+    return _group_var(inventory, cert_group_name, "ipa_domain", "")
+
+
+@pytest.fixture(scope="session")
+def ipa_ca_subject(inventory, cert_group_name) -> str:
+    return _group_var(inventory, cert_group_name, "ipa_ca_subject", "Certificate Authority")
+
+
+@pytest.fixture(scope="session")
+def ipaclient_host_name(inventory, ipaclient_group_name) -> str:
+    hosts = inventory.group_hosts(ipaclient_group_name)
+    if hosts:
+        hv = inventory.hostvars(hosts[0])
+        return _resolve_ssh_target(hosts[0], hv)
+    return os.environ.get("IPACLIENT_HOST", "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Variable merge fixtures
+# Per-host variable helper — use inside tests for host-specific values
 # ─────────────────────────────────────────────────────────────────────────────
 
-@pytest.fixture(scope="session")
-def all_role_defaults(role_roots) -> dict:
-    """Merge defaults/main.yml from all roles. Equal weight, lowest priority."""
-    return _load_all_role_defaults(role_roots)
-
-
-@pytest.fixture(scope="session")
-def group_vars_data(infra_inventory_dir, cert_group_name) -> dict:
-    """Load group_vars/all + group_vars/certificate_group from the infra dir."""
-    gv_dir = os.path.join(infra_inventory_dir, "group_vars")
-    return _load_group_vars_dir(gv_dir, cert_group_name)
-
-
-@pytest.fixture(scope="session")
-def infra_vars_data(infra_inventory_dir) -> dict:
-    """Load optional infra_vars.yml (infra-level overrides)."""
-    for candidate in (
-        os.path.join(infra_inventory_dir, "infra_vars.yml"),
-        os.path.join(infra_inventory_dir, "infra_vars", "main.yml"),
-    ):
-        data = _load_yaml(candidate)
-        if data:
-            return data
-    return {}
-
-
-@pytest.fixture(scope="session")
-def merged_vars(all_role_defaults, group_vars_data, infra_vars_data) -> dict:
+def host_vars(inventory: AnsibleInventory, hostname: str) -> dict:
     """
-    Session-level merged variable dict (no host_vars yet).
-    Merge order: role defaults < group_vars/all < group_vars/<group> < infra_vars
+    Return fully merged variables for *hostname*.
+    Call this inside a test when you need a value that may differ per host:
+
+        def test_file_owner(inventory, cert_host, cert_base_dir):
+            hv    = host_vars(inventory, cert_host.short_name)
+            owner = hv.get("cert_owner", "root")
     """
-    base = _deep_merge(all_role_defaults, group_vars_data)
-    return _deep_merge(base, infra_vars_data)
+    return inventory.hostvars(hostname)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public helper — apply host_vars per test
+# Connection fixtures
 # ─────────────────────────────────────────────────────────────────────────────
 
-def host_merged_vars_for(hostname: str, infra_inventory_dir: str, base_vars: dict) -> dict:
+@pytest.fixture(scope="session")
+def local_connection():
     """
-    Apply host_vars/<hostname> on top of the session-level merged_vars.
-    Call this inside individual tests that need per-host variable overrides:
-
-        hvars = host_merged_vars_for(cert_host, infra_inventory_dir, merged_vars)
-        owner = hvars.get("cert_owner", cert_owner)
+    testinfra local:// backend — for tests that run on the controller.
+    No SSH involved. Use for localhost-targeted test files.
     """
-    hv_dir = os.path.join(infra_inventory_dir, "host_vars")
-    hv = _load_host_vars(hv_dir, hostname)
-    return _deep_merge(base_vars, hv)
+    import testinfra
+    return testinfra.get_host("local://")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Derived variable fixtures
+# sudo helper — available to all test files
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session")
-def cert_base_dir(merged_vars) -> str:
-    return merged_vars.get("cert_base_dir", "/data/certificates")
+def sudo_password(infra_dir) -> str:
+    """
+    Read sudo password from plain YAML keypass.yml.
 
-@pytest.fixture(scope="session")
-def cert_types(merged_vars) -> list:
-    return merged_vars.get("cert_types", ["client", "server"])
+    Structure:
+        keepass_entries:
+          ansible_user:
+            key: nsbl
+            value: <sudo_password>
 
-@pytest.fixture(scope="session")
-def cert_validity_days(merged_vars) -> int:
-    return int(merged_vars.get("cert_validity_days", 365))
-
-@pytest.fixture(scope="session")
-def ipa_realm(merged_vars) -> str:
-    return merged_vars.get("ipa_realm", "")
-
-@pytest.fixture(scope="session")
-def ipa_domain(merged_vars) -> str:
-    return merged_vars.get("ipa_domain", "")
-
-@pytest.fixture(scope="session")
-def ipa_ca_subject(merged_vars) -> str:
-    return merged_vars.get("ipa_ca_subject", "Certificate Authority")
-
-@pytest.fixture(scope="session")
-def cert_owner(merged_vars) -> str:
-    return merged_vars.get("cert_owner", "root")
-
-@pytest.fixture(scope="session")
-def cert_group(merged_vars) -> str:
-    return merged_vars.get("cert_group", "root")
-
-@pytest.fixture(scope="session")
-def cert_file_mode(merged_vars) -> str:
-    return merged_vars.get("cert_file_mode", "0644")
-
-@pytest.fixture(scope="session")
-def key_file_mode(merged_vars) -> str:
-    return merged_vars.get("key_file_mode", "0600")
-
-@pytest.fixture(scope="session")
-def ipaclient_host_name(merged_vars) -> str:
-    return (
-        merged_vars.get("ipaclient_host")
-        or os.environ.get("IPACLIENT_HOST", "")
+    Location (first found):
+      1. KEYPASS_FILE env var
+      2. inventories/<infra>/group_vars/keypass.yml
+    """
+    keypass_file = (
+        os.environ.get("KEYPASS_FILE")
+        or os.path.join(infra_dir, "group_vars", "keypass.yml")
     )
-
-@pytest.fixture(scope="session")
-def certificate_hosts(hosts_ini_path, cert_group_name) -> list:
-    """
-    Session fixture version of the host list (used in test_ipaclient.py etc.
-    where cert_host parametrisation is not needed but the list is).
-    """
-    env_hosts = os.environ.get("CERTIFICATE_HOSTS", "")
-    if env_hosts:
-        return [h.strip() for h in env_hosts.split(",") if h.strip()]
-    return _parse_ini_hosts(hosts_ini_path, cert_group_name)
+    if not os.path.isfile(keypass_file):
+        raise FileNotFoundError(
+            f"keypass.yml not found: {keypass_file}\n"
+            "Set KEYPASS_FILE env var or place at inventories/<infra>/group_vars/keypass.yml"
+        )
+    data = _load_yaml(keypass_file)
+    try:
+        return data["keepass_entries"]["ansible_user"]["value"]
+    except KeyError as exc:
+        raise KeyError(
+            f"Missing key in keypass.yml: {exc}. "
+            "Expected: keepass_entries.ansible_user.value"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -410,17 +726,17 @@ def certificate_hosts(hosts_ini_path, cert_group_name) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.fixture(scope="session", autouse=True)
-def _print_resolved_config(
-    infra_name, role_roots, merged_vars,
-    certificate_hosts, cert_base_dir,
-    ipa_realm, ipa_domain, ipaclient_host_name,
+def _print_session_config(
+    infra_name, role_roots, inventory,
+    cert_group_name, ipaclient_group_name,
 ):
+    cert_hosts = inventory.group_hosts(cert_group_name)
+    ipa_hosts  = inventory.group_hosts(ipaclient_group_name)
+
     print("\n" + "═" * 64)
-    print(f"  INFRA          : {infra_name}")
-    print(f"  ROLE ROOTS     : {role_roots}")
-    print(f"  CERT HOSTS     : {certificate_hosts}")
-    print(f"  CERT BASE DIR  : {cert_base_dir}")
-    print(f"  IPA REALM      : {ipa_realm  or '(not set)'}")
-    print(f"  IPA DOMAIN     : {ipa_domain or '(not set)'}")
-    print(f"  IPACLIENT HOST : {ipaclient_host_name or '(not set)'}")
+    print(f"  INFRA            : {infra_name}")
+    print(f"  ROLE ROOTS       : {role_roots}")
+    print(f"  CERT GROUP       : {cert_group_name}  → {cert_hosts}")
+    print(f"  IPACLIENT GROUP  : {ipaclient_group_name}  → {ipa_hosts}")
+    print(f"  ansible-inventory: {'available' if shutil.which('ansible-inventory') else "NOT FOUND — using fallback parser"}")
     print("═" * 64 + "\n")
